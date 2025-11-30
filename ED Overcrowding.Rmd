@@ -1,0 +1,522 @@
+---
+title: "Emergency Department Overcrowding"
+author: "Rakin Shafi Islam"
+date: "2025-11-29"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tibble)
+library(dplyr)
+library(ggplot2)
+library(pwr)
+
+library(DBI)
+library(RPostgres)
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(randomForest)
+library(broom)
+library(xgboost)
+library(ranger)
+library(glmnet)
+library(seedhash)
+
+RandomForestRegressor <- sklearn$ensemble$RandomForestRegressor
+GridSearchCV <- sklearn$model_selection$GridSearchCV
+
+library(SHAPforxgboost)
+
+reticulate::py_install("scikit-learn")
+reticulate::py_install(c("pandas"))
+reticulate::py_install("optuna")
+pak::pkg_install("github::melhzy/seedhash/R")
+install.packages("pak", repos = "https://r-lib.github.io/p/pak/stable/")
+
+sklearn <- import("sklearn")
+library(reticulate)
+optuna <- import("optuna")
+np <- import("numpy")
+pd <- import("pandas")
+optuna <- import("optuna")
+library(iml)
+
+```
+
+
+
+```{r - Data}
+
+#Read Dataset
+ds <- read.csv("admissions.csv.gz")
+
+#Create LOS variable
+ed_data <- ds %>%
+  mutate(
+    EDREGTIME = as.POSIXct(EDREGTIME, format = "%Y-%m-%d %H:%M:%S"),
+    EDOUTTIME = as.POSIXct(EDOUTTIME, format = "%Y-%m-%d %H:%M:%S"),
+    DEATHTIME = as.POSIXct(DEATHTIME, format = "%Y-%m-%d %H:%M:%S"),
+    DISCHTIME = as.POSIXct(DISCHTIME, format = "%Y-%m-%d %H:%M:%S")
+  ) %>%
+  mutate(
+    ed_los_hrs = as.numeric(difftime(EDOUTTIME, EDREGTIME, units = "hours")),
+  ) %>%
+  filter(ed_los_hrs > 0)
+
+# Rows of data before vs after data preprocessing
+nrow(ds)
+nrow(ed_data)
+
+#Statistical power necessary
+pwr.f2.test(u = 11, f2 = 0.15, sig.level = 0.05, power = 0.80)
+
+#Sample Dataset
+sample_ds <- ed_data[sample(nrow(ed_data), 7000), ]
+
+#LOS Summaries
+summary(sample_ds$ed_los_hrs)
+
+plot(sample_ds$ed_los_hrs)
+
+p <- ggplot(sample_ds, aes(y = ed_los_hrs)) +
+  geom_boxplot(fill = "skyblue", color = "darkblue") +
+  labs(
+    title = "Boxplot of ED Length of Stay (Hours)",
+    y = "LOS",
+    x = NULL         
+  ) +
+  coord_cartesian(ylim = c(0, 30)) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+    axis.text.x = element_blank(),   
+    axis.ticks.x = element_blank()  
+  )
+
+p
+
+```
+
+
+
+```{r - Linear Model}
+
+#Seed Generator
+generator <- SeedHashGenerator$new("ED Overcrowding")
+seeds <- generator$generate_seeds(10)
+seeds
+
+
+set.seed(253991796)
+model_lm <- lm(ed_los_hrs ~ DIAGNOSIS + ADMISSION_TYPE + ADMISSION_LOCATION + HOSPITAL_EXPIRE_FLAG + DISCHARGE_LOCATION + LANGUAGE + HAS_CHARTEVENTS_DATA + ETHNICITY + RELIGION + INSURANCE + MARITAL_STATUS, data = sample_ds)
+summary(model_lm)
+
+
+# Filter for significant predictors
+tidy_model1 <- tidy(model_lm)
+sig_vars <- tidy_model1 %>%
+  filter(p.value < 0.005)
+
+sig_vars
+
+```
+
+
+
+```{r - RF Model}
+
+set.seed(859005103)
+trainIndex <- createDataPartition(sample_ds$ed_los_hrs, p = 0.8, list = FALSE)
+train_data <- sample_ds[trainIndex, ]
+test_data <- sample_ds[-trainIndex, ]
+
+rf_model_Pre_Optimization <- randomForest(ed_los_hrs ~ DIAGNOSIS + ADMISSION_TYPE + ADMISSION_LOCATION + HOSPITAL_EXPIRE_FLAG + DISCHARGE_LOCATION + LANGUAGE + HAS_CHARTEVENTS_DATA + ETHNICITY + RELIGION + INSURANCE + MARITAL_STATUS, data = train_data, ntree = 500, mtry = 4, importance = TRUE)
+
+preds <- predict(rf_model, newdata = test_data)
+
+MAE  <- mean(abs(preds - test_data$ed_los_hrs))
+RMSE <- sqrt(mean((preds - test_data$ed_los_hrs)^2))
+R2   <- cor(preds, test_data$ed_los_hrs)^2
+
+print(c(MAE = MAE, RMSE = RMSE, R2 = R2))
+```
+
+
+
+```{r - RF Model - Optimazation}
+#Convert train / test data to pandas dataframe
+X_train <- as.data.frame(train_data[, c("DIAGNOSIS", "ADMISSION_TYPE", "ADMISSION_LOCATION", "HOSPITAL_EXPIRE_FLAG", "DISCHARGE_LOCATION", "LANGUAGE","HAS_CHARTEVENTS_DATA", "ETHNICITY", "RELIGION", "INSURANCE", "MARITAL_STATUS")])
+y_train <- train_data$ed_los_hrs
+X_train <- model.matrix(~ . - 1, data = X_train)
+
+
+#Optimization using optuna
+
+py_run_string("
+import optuna
+from sklearn.model_selection import cross_val_score
+from sklearn.ensemble import RandomForestRegressor
+
+def objective(trial):
+    n_estimators = trial.suggest_int('n_estimators', 100, 1000)
+    max_depth = trial.suggest_int('max_depth', 5, 50)
+    min_samples_split = trial.suggest_int('min_samples_split', 2, 10)
+    min_samples_leaf = trial.suggest_int('min_samples_leaf', 1, 4)
+    rf = RandomForestRegressor(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        min_samples_split=min_samples_split,
+        min_samples_leaf=min_samples_leaf,
+        random_state=253991796
+    )
+    score = cross_val_score(rf, r.X_train, r.y_train, cv=3, scoring='r2').mean()
+    return score
+
+study = optuna.create_study(direction='maximize')
+study.optimize(objective, n_trials=100)
+best_params = study.best_params
+best_value = study.best_value
+")
+
+best_params <- py$best_params
+best_value  <- py$best_value
+
+# Revised RF Model using optimized parameters calculated above
+set.seed(253991796)
+
+rf_final <- randomForest(
+  ed_los_hrs ~ DIAGNOSIS + ADMISSION_TYPE + ADMISSION_LOCATION + HOSPITAL_EXPIRE_FLAG + 
+    DISCHARGE_LOCATION + LANGUAGE + HAS_CHARTEVENTS_DATA + ETHNICITY + 
+    RELIGION + INSURANCE + MARITAL_STATUS,
+  data = train_data,
+  ntree = 968,       
+  maxnodes = 16,     
+  nodesize = 9,      
+  mtry = 4,
+  importance = TRUE
+)
+
+rf_final <- ranger(
+  formula = ed_los_hrs ~ DIAGNOSIS + ADMISSION_TYPE + 
+    ADMISSION_LOCATION + HOSPITAL_EXPIRE_FLAG + 
+    DISCHARGE_LOCATION + LANGUAGE + HAS_CHARTEVENTS_DATA + ETHNICITY + 
+    RELIGION + INSURANCE + MARITAL_STATUS,
+  data = train_data,
+  num.trees = 968,
+  max.depth = 16,
+  min.node.size = 3,   
+  importance = "permutation"
+)
+
+preds <- predict(rf_final, data = test_data)$predictions
+
+# Compute metrics
+MAE <- mean(abs(preds - test_data$ed_los_hrs))
+RMSE <- sqrt(mean((preds - test_data$ed_los_hrs)^2))
+R2 <- cor(preds, test_data$ed_los_hrs)^2
+
+print(c(MAE = MAE, RMSE = RMSE, R2 = R2))
+```
+
+
+```{r - RF Model - Visuals}
+
+#Variable Importance Pre - Optimization
+varImpPlot(rf_model_Pre_Optimization)
+
+# Variable Importance plots Post - Optimization
+
+imp <- importance(rf_final)
+
+imp_MSE <- data.frame(
+  Feature = names(imp),
+  Importance = imp,
+  row.names = NULL
+)
+
+# %Increase in MSE plot
+ggplot(imp_MSE, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "rf_model_Post_Optimization",
+       x = "Feature",
+       y = "% Increase in MSE") +
+  theme_minimal()
+
+
+#Second RF model with different 'Importance' setting 
+rf_final_impurity <- ranger(
+  formula = ed_los_hrs ~ DIAGNOSIS + ADMISSION_TYPE + 
+    ADMISSION_LOCATION + HOSPITAL_EXPIRE_FLAG + 
+    DISCHARGE_LOCATION + LANGUAGE + HAS_CHARTEVENTS_DATA + ETHNICITY + 
+    RELIGION + INSURANCE + MARITAL_STATUS,
+  data = train_data,
+  num.trees = 968,
+  max.depth = 16,
+  min.node.size = 3,   
+  importance = "impurity"
+)
+
+imp_impurity <- importance(rf_final_impurity)
+
+imp_Node <- data.frame(
+  Feature = names(imp),
+  Importance = imp_impurity,
+  row.names = NULL
+)
+
+# Increase in Node Purity Plot 
+ggplot(imp_Node, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "rf_model_Post_Optimization_Purity",
+       x = "Feature",
+       y = "Increase in Node Purity") +
+  theme_minimal()
+
+# Unique class values
+
+sapply(sample_ds[c("DIAGNOSIS", "ADMISSION_TYPE", "ADMISSION_LOCATION", "HOSPITAL_EXPIRE_FLAG", "DISCHARGE_LOCATION", "LANGUAGE","HAS_CHARTEVENTS_DATA", "ETHNICITY", "RELIGION", "INSURANCE", "MARITAL_STATUS")], function(x) length(unique(x)))
+
+
+
+```
+
+
+
+```{r - XGBoost}
+
+# Matrix conversion for XGBoost model
+X_train <- as.data.frame(train_data[, c("DIAGNOSIS", "ADMISSION_TYPE", "ADMISSION_LOCATION", "HOSPITAL_EXPIRE_FLAG", "DISCHARGE_LOCATION", "LANGUAGE","HAS_CHARTEVENTS_DATA", "ETHNICITY", "RELIGION", "INSURANCE", "MARITAL_STATUS")])
+y_train <- train_data$ed_los_hrs
+X_train <- model.matrix(~ . - 1, data = X_train)
+
+# XGboost model
+formula <- ed_los_hrs ~ DIAGNOSIS + ADMISSION_TYPE + ADMISSION_LOCATION + 
+  HOSPITAL_EXPIRE_FLAG + DISCHARGE_LOCATION + LANGUAGE + HAS_CHARTEVENTS_DATA +
+  ETHNICITY + RELIGION + INSURANCE + MARITAL_STATUS
+
+
+# Target variable
+train_label <- train_data$ed_los_hrs
+
+
+train_matrix <- model.matrix(formula, data = train_data)[, -1]
+dtrain <- xgb.DMatrix(data = train_matrix, label = train_label)
+
+set.seed(228096222)
+
+xgb_model <- xgboost(
+  data = dtrain,
+  objective = "reg:squarederror",  
+  nrounds = 100,                   
+  eta = 0.1,                       
+  max_depth = 6,                   
+  subsample = 0.8,                 
+  colsample_bytree = 0.8,          
+  verbose = 1
+)
+
+xgb_model
+
+train_pred <- predict(xgb_model, dtrain)
+
+# Evaluation metrics
+mae <- mean(abs(train_pred - train_label))
+rmse <- sqrt(mean((train_pred - train_label)^2))
+r2 <- 1 - sum((train_pred - train_label)^2) / sum((train_label - mean(train_label))^2)
+
+print(c(MAE = mae, RMSE = rmse, R2 = r2))
+
+```
+
+
+```{r - XGBoost - Optimization}
+#Optimize XGBoost parameters
+xgb_py <- reticulate::import("xgboost")
+train_matrix <- model.matrix(formula, data = train_data)[, -1]
+train_label  <- train_data$ed_los_hrs
+
+dtrain <- xgb_py$DMatrix(data = train_matrix, label = train_label)
+
+objective <- function(trial) {
+  params <- dict(
+    objective = "reg:squarederror",
+    verbosity = as.integer(0),
+    eta = trial$suggest_float("eta", 0.01, 0.3),
+    max_depth = trial$suggest_int("max_depth", 3, 15),
+    subsample = trial$suggest_float("subsample", 0.5, 1.0),
+    colsample_bytree = trial$suggest_float("colsample_bytree", 0.5, 1.0),
+    min_child_weight = trial$suggest_float("min_child_weight", 1, 10),
+    gamma = trial$suggest_float("gamma", 0, 5)
+  )
+
+  nrounds <- trial$suggest_int("nrounds", 100, 600)
+
+  model <- xgb_py$train(
+    params = params,
+    dtrain = dtrain,
+    num_boost_round = nrounds
+  )
+  pred <- model$predict(dtrain)
+  rmse <- sqrt(mean((pred - train_label)^2))
+  return(rmse)
+}
+
+optuna <- import("optuna")
+study <- optuna$create_study(direction = "minimize")
+study$optimize(objective, n_trials = 50)
+
+best_params <- py_to_r(study$best_params)
+
+#Separate nrounds from other parameters
+nrounds <- best_params$nrounds
+params <- best_params
+params$nrounds <- NULL
+
+dtrain <- xgb.DMatrix(data = train_matrix, label = train_label)
+
+xgb_final <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = nrounds,
+  verbose = 1
+)
+
+
+# 6. Make predictions and evaluate
+train_pred <- predict(xgb_final, dtrain)
+mae  <- mean(abs(train_pred - train_label))
+rmse <- sqrt(mean((train_pred - train_label)^2))
+r2   <- 1 - sum((train_pred - train_label)^2) / sum((train_label - mean(train_label))^2)
+
+cat("MAE:", mae, "\nRMSE:", rmse, "\nR2:", r2)
+
+```
+
+
+```{r - XGBoost - Data Visuals}
+
+# Top 25 features
+feature_names <- colnames(train_matrix)
+
+importance_matrix <- xgb.importance(feature_names = feature_names, model = xgb_final)
+
+top25_importance <- importance_matrix[1:25, ]
+
+
+ggplot(top25_importance, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "25 Most Valuable Predictors", x = "Feature", y = "Gain") +
+  theme_minimal()
+
+
+#Bottom 25 features
+least25 <- importance_matrix[order(importance_matrix$Gain), ][1:25, ]
+
+ggplot(least25, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "tomato") +
+  coord_flip() +
+  labs(
+    title = "25 Least Valuable Predictors",
+    x = "Predictor",
+    y = "Gain"
+  )
+
+preds <- predict(xgb_final, dtrain)
+plot(train_label, preds, xlab="Actual", ylab="Predicted", main="XGBoost Predictions")
+
+```
+
+
+```{r - Lasso Feature Selection - XGB }
+
+# matrix of predictors
+x <- model.matrix(ed_los_hrs ~ DIAGNOSIS + ADMISSION_TYPE + ADMISSION_LOCATION + HOSPITAL_EXPIRE_FLAG + 
+    DISCHARGE_LOCATION + LANGUAGE + HAS_CHARTEVENTS_DATA + ETHNICITY + 
+    RELIGION + INSURANCE + MARITAL_STATUS, data = train_data)[, -1]
+
+y <- train_data$ed_los_hrs
+
+# Fit LASSO (alpha = 1)
+lasso_fit <- cv.glmnet(
+  x, y,
+  alpha = 1,            
+  nfolds = 10
+)
+
+# Select coefficients at lambda that minimizes CV error
+coef_lasso <- coef(lasso_fit, s = "lambda.min")
+
+# Extract non-zero coefficients (selected features)
+selected_features_lasso <- rownames(coef_lasso)[coef_lasso[,1] != 0]
+
+# Remove intercept
+selected_features_lasso <- selected_features_lasso[selected_features_lasso != "(Intercept)"]
+
+```
+
+```{r - Xgb model - Lasso features}
+x_full <- model.matrix(
+  ed_los_hrs ~ DIAGNOSIS + ADMISSION_TYPE + ADMISSION_LOCATION + 
+    HOSPITAL_EXPIRE_FLAG + DISCHARGE_LOCATION + LANGUAGE + 
+    HAS_CHARTEVENTS_DATA + ETHNICITY + RELIGION + INSURANCE + MARITAL_STATUS,
+  data = train_data
+)[, -1]
+
+x_lasso <- x_full[, selected_features_lasso, drop = FALSE]
+
+y <- train_data$ed_los_hrs
+
+# Convert to DMatrix
+dtrain <- xgboost::xgb.DMatrix(data = x_lasso, label = y)
+
+# Train your XGBoost model (example)
+xgb_lasso <- xgboost::xgboost(
+  params = params,
+  data = dtrain,
+  nrounds = nrounds,
+  verbose = 1
+)
+
+train_pred <- predict(xgb_lasso, dtrain)
+
+# Evaluation metrics
+mae <- mean(abs(train_pred - train_label))
+rmse <- sqrt(mean((train_pred - train_label)^2))
+r2 <- 1 - sum((train_pred - train_label)^2) / sum((train_label - mean(train_label))^2)
+cat("MAE:", mae, "\nRMSE:", rmse, "\nR2:", r2)
+
+
+# Top 25 features
+importance_matrix <- xgb.importance(
+  feature_names = colnames(x_lasso),  # use the names of the features used in training
+  model = xgb_lasso
+)
+
+top_importance <- importance_matrix[1:min(25, nrow(importance_matrix)), ]
+
+ggplot(top_importance, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 25 Lasso Features", x = "Feature", y = "Gain") +
+  theme_minimal()
+
+# Bottom 25 features
+importance_matrix <- importance_matrix[order(importance_matrix$Gain), ]
+
+bottom_features <- importance_matrix[1:min(25, nrow(importance_matrix)), ]
+
+ggplot(bottom_features, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "lightcoral") +
+  coord_flip() +
+  labs(title = "Bottom 25 Lasso Features", x = "Feature", y = "Gain") +
+  theme_minimal()
+
+
+```
+
