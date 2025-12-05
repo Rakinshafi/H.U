@@ -21,14 +21,11 @@ library(caret)
 library(randomForest)
 library(broom)
 library(xgboost)
+library(SHAPforxgboost)
 library(ranger)
 library(glmnet)
 library(seedhash)
-
-RandomForestRegressor <- sklearn$ensemble$RandomForestRegressor
-GridSearchCV <- sklearn$model_selection$GridSearchCV
-
-library(SHAPforxgboost)
+library(Metrics)
 
 reticulate::py_install("scikit-learn")
 reticulate::py_install(c("pandas"))
@@ -37,18 +34,26 @@ pak::pkg_install("github::melhzy/seedhash/R")
 install.packages("pak", repos = "https://r-lib.github.io/p/pak/stable/")
 
 sklearn <- import("sklearn")
+RandomForestRegressor <- sklearn$ensemble$RandomForestRegressor
+GridSearchCV <- sklearn$model_selection$GridSearchCV
 library(reticulate)
 optuna <- import("optuna")
 np <- import("numpy")
 pd <- import("pandas")
 optuna <- import("optuna")
 library(iml)
+library(data.table)
 
 ```
 
 
 
 ```{r - Data}
+
+train_index <- createDataPartition(ed_data$admission_type, p = 0.3, list = FALSE)
+
+# Subset your dataset
+ed_sample <- ed_data[train_index, ]
 
 #Read Dataset
 ds <- read.csv("admissions.csv.gz")
@@ -65,6 +70,7 @@ ed_data <- ds %>%
     ed_los_hrs = as.numeric(difftime(EDOUTTIME, EDREGTIME, units = "hours")),
   ) %>%
   filter(ed_los_hrs > 0)
+
 
 # Rows of data before vs after data preprocessing
 nrow(ds)
@@ -97,6 +103,7 @@ p <- ggplot(sample_ds, aes(y = ed_los_hrs)) +
   )
 
 p
+
 
 ```
 
@@ -187,18 +194,6 @@ best_value  <- py$best_value
 # Revised RF Model using optimized parameters calculated above
 set.seed(253991796)
 
-rf_final <- randomForest(
-  ed_los_hrs ~ DIAGNOSIS + ADMISSION_TYPE + ADMISSION_LOCATION + HOSPITAL_EXPIRE_FLAG + 
-    DISCHARGE_LOCATION + LANGUAGE + HAS_CHARTEVENTS_DATA + ETHNICITY + 
-    RELIGION + INSURANCE + MARITAL_STATUS,
-  data = train_data,
-  ntree = 968,       
-  maxnodes = 16,     
-  nodesize = 9,      
-  mtry = 4,
-  importance = TRUE
-)
-
 rf_final <- ranger(
   formula = ed_los_hrs ~ DIAGNOSIS + ADMISSION_TYPE + 
     ADMISSION_LOCATION + HOSPITAL_EXPIRE_FLAG + 
@@ -210,6 +205,7 @@ rf_final <- ranger(
   min.node.size = 3,   
   importance = "permutation"
 )
+
 
 preds <- predict(rf_final, data = test_data)$predictions
 
@@ -371,7 +367,7 @@ study <- optuna$create_study(direction = "minimize")
 study$optimize(objective, n_trials = 50)
 
 best_params <- py_to_r(study$best_params)
-
+best_params
 #Separate nrounds from other parameters
 nrounds <- best_params$nrounds
 params <- best_params
@@ -394,6 +390,71 @@ rmse <- sqrt(mean((train_pred - train_label)^2))
 r2   <- 1 - sum((train_pred - train_label)^2) / sum((train_label - mean(train_label))^2)
 
 cat("MAE:", mae, "\nRMSE:", rmse, "\nR2:", r2)
+
+#Shap
+shap_values <- shap.values(xgb_model = xgb_final, X_train = train_matrix)
+shap_score <- shap_values$shap_score
+shap_importance <- shap_values$mean_shap_score
+
+shap_long <- shap.prep(shap_contrib = shap_score, X_train = train_matrix)
+
+top_features <- names(sort(shap_importance, decreasing = TRUE))[1:10]
+
+top_features
+
+```
+
+
+```{r - XGBoost - Loop}
+
+# Create a list to store model results
+xgb_results <- list()
+
+# Loop over each seed
+for (i in seq_along(seeds)) {
+  
+  set.seed(seeds[i])  # Set seed for reproducibility
+  
+  # Prepare DMatrix (if needed)
+  dtrain <- xgb.DMatrix(data = train_matrix, label = train_label)
+  
+  # Train XGBoost model
+  xgb_model
+  
+  # Store model in the list
+  xgb_results[[paste0("seed_", seeds[i])]] <- xgb_final
+}
+
+predictions <- list()
+
+for (i in seq_along(seeds)) {
+  predictions[[i]] <- predict(xgb_results[[i]], dtrain)
+}
+
+ # for RMSE, MAE
+
+performance <- data.frame(
+  seed = seeds,
+  RMSE = NA,
+  MAE = NA,
+  R2 = NA
+)
+seedsnum <- seeds
+seedsnum
+for (i in seq_along(seeds)) {
+  # Get model
+  model <- xgb_results[[i]]
+  
+  # Make predictions
+  preds <- predict(model, dtrain)
+  
+  # Compute metrics
+  performance$RMSE[i] <- rmse(train_label, preds)
+  performance$MAE[i]  <- mae(train_label, preds)
+  performance$R2[i]   <- cor(train_label, preds)^2
+}
+
+performance
 
 ```
 
@@ -516,6 +577,61 @@ ggplot(bottom_features, aes(x = reorder(Feature, Gain), y = Gain)) +
   coord_flip() +
   labs(title = "Bottom 25 Lasso Features", x = "Feature", y = "Gain") +
   theme_minimal()
+```
+
+
+```{r - EDA}
+
+sample_ds$LANGUAGE <- as.factor(sample_ds$LANGUAGE)
+
+avg_los <- sample_ds %>%
+  group_by(LANGUAGE) %>%
+  summarise(mean_LOS = mean(ed_los_hrs, na.rm = TRUE))
+
+# Plot
+ggplot(avg_los, aes(x = reorder(LANGUAGE, -mean_LOS), y = mean_LOS)) +
+  geom_col(fill = "lightblue") +
+  theme_minimal() +
+  labs(
+    title = "Average Length of Stay by Language",
+    x = "LANGUAGE",
+    y = "Average LOS (hours)"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+sample_ds$ETHNICITY <- as.factor(sample_ds$ETHNICITY)
+
+avg_los <- sample_ds %>%
+  group_by(ETHNICITY) %>%
+  summarise(mean_LOS = mean(ed_los_hrs, na.rm = TRUE))
+
+# Plot
+ggplot(avg_los, aes(x = reorder(ETHNICITY, -mean_LOS), y = mean_LOS)) +
+  geom_col(fill = "lightgreen") +
+  theme_minimal() +
+  labs(
+    title = "Average Length of Stay by ETHNICITY",
+    x = "Ethnicity",
+    y = "Average LOS (hours)"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+sample_ds$RELIGION <- as.factor(sample_ds$RELIGION)
+
+avg_los <- sample_ds %>%
+  group_by(RELIGION) %>%
+  summarise(mean_LOS = mean(ed_los_hrs, na.rm = TRUE))
+
+# Plot
+ggplot(avg_los, aes(x = reorder(RELIGION, -mean_LOS), y = mean_LOS)) +
+  geom_col(fill = "lightpink") +
+  theme_minimal() +
+  labs(
+    title = "Average Length of Stay by RELIGION",
+    x = "RELIGION",
+    y = "Average LOS (hours)"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
 
 ```
